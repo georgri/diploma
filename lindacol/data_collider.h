@@ -57,6 +57,12 @@ void unset_hw_bp (struct mod_insn * data, struct insn * insn);
 // 11) Function to unset an instruction bp
 void unset_insn_bp (struct insn * insn);
 
+// 11.5) Function to disable (not unset) an instruction bp
+void disable_insn_bp (struct insn *insn);
+
+// 11.6) Function to enable an (already set but disabled) instruction bp
+void enable_insn_bp (struct insn *insn);
+
 // 12) Function to determine a quantity of instuction breakpoints to set.
 uint calc_needed_bp (struct mod_insn *data);
 

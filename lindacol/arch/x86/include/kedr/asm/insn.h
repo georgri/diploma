@@ -91,6 +91,7 @@ struct insn {
 	const insn_byte_t *next_byte;
 
 	uint is_bp; // is breakpoint set upon this instruction
+	uint is_disabled; // is bp disabled (valid only when is_bp <> 0)
 	struct kprobe kp;
 	struct pt_regs * pt_regs;
 	struct addr_info addr_info;

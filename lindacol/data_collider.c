@@ -15,6 +15,20 @@
 #include "debug_util.h"
 #include "util.h"
 
+// TODO: Function to initialize mod_insn structure. Initial size must be 0!
+#define MAX_INSNS_SIZE 4096
+// Container of module information
+struct mod_insn {
+	char * module_name;
+	void * address; // of the beginning in memory
+	int instructions_total; // the number of all instructions in module (for stats)
+	struct insn ** insns; // set of pointers to instructions accessing memory
+	int size; // size of insns
+	int bp_count; // number of bp set
+	struct insn * insn; // null if we are not doing some analysis at the moment
+	struct perf_event * __percpu *hw_bp; // there may be only one HW bp
+};
+
 
 unsigned int shift1[4] = {6, 2, 13, 3};
 unsigned int shift2[4] = {13, 27, 21, 12};
@@ -97,19 +111,7 @@ static void rand_init(void) {
 	get_random_bytes(randStates, sizeof(int) * 4);
 }
 
-// TODO: Function to initialize mod_insn structure. Initial size must be 0!
-#define MAX_INSNS_SIZE 4096
-// Container of module information
-struct mod_insn {
-	char * module_name;
-	void * address; // of the beginning in memory
-	int instructions_total; // the number of all instructions in module (for stats)
-	struct insn ** insns; // set of pointers to instructions accessing memory
-	int size; // size of insns
-	int bp_count; // number of bp set
-	struct insn * insn; // null if we are not doing some analysis at the moment
-	struct perf_event * __percpu *hw_bp; // there may be only one HW bp
-};
+
 
 //// Information about address block
 //struct addr_info {
@@ -387,17 +389,17 @@ void set_bp_auto (struct mod_insn * data, int timeout) {
 	bp_to_set = determine_bp_quantity(data, timeout);
 	debug_util_print_string("\nThe determined number of instructions to set bp upon is:");
 	debug_util_print_u64(bp_to_set, "%d");
-	while (bp_to_set > 0) {
+	while (bp_to_set > 0) { // Эта функция может и зациклиться, при удачном стечении обстоятельств.
 		index = ((rand() % data->size) + data->size) % data->size;
-		if (!data->insns[index]->is_bp) {
+		if (!data->insns[index]->is_bp || data->insns[index]->is_disabled) {
 			//debug_util_print_string("\nSeting a BP upon instruction with index: ");
 			//debug_util_print_u64(index, "%d");
 			// Мы нашли инструкцию, на которую не поставлена точка прерывания.
-			set_insn_bp(data->insns[index]); // Оно поставит признак того, что поставлена точка прерывания.
-			if (data->insns[index]->is_bp) {
-				bp_to_set --; // не знаю, что будет, если по каким-то причинам этот признак is_bp не будет проставляться
-			}
-			//bp_to_set --; // Пока, на всякий случай, уменьшаем при любом стечении обстоятельств.
+			set_insn_bp(data->insns[index]); // Поставит bp или активирует неактивную
+			// Если вдруг даже не удалось поставить точку прерывания, всё равно уменьшаем
+			// счётчик. Значит, произошло что-то нехорошее, и сейчас не надо пытаться 
+			// поставить много точек. В следующий раз может повезти больше.
+			bp_to_set --;
 		}
 	}
 	debug_util_print_string("\n");
@@ -407,47 +409,48 @@ void set_bp_auto (struct mod_insn * data, int timeout) {
 }
 
 // 3) Function to set a single breakpoint upon instruction. This function also
-// binds breakpoint handler.
+// binds breakpoint handlers.
 void set_insn_bp (struct insn* insn) {
 	//http://lxr.free-electrons.com/source/samples/kprobes/kprobe_example.c
 	int ret;
 	if (insn->is_bp) {
-		// Вызывающая функция, вообще говоря, должна позаботиться, чтобы этот
-		// флаг был снят.
-		debug_util_print_string("\nIt seems that instruction bp is already set: ");
-		debug_util_print_u64(PTR_ERR(insn->kaddr), "%p");
-		return;
+		// Может быть задизейблена, так что надо ещё проверить
+		if (!insn->is_disabled) {
+		// Вызывающая функция, вообще говоря, должна позаботиться, чтобы такого
+		// не случилось
+			debug_util_print_string("\nIt seems that instruction bp is already set and enabled: ");
+			debug_util_print_u64(PTR_ERR(insn->kaddr), "%p");
+			return;
+		} else {
+			enable_insn_bp(insn); // передаём ответственность фунции активации
+			return;
+		}
 	}
 	// жалко, что в Си нет оператора clear(...), который бы очищал всю структуру...
 	insn->kp.addr = (void*)insn->kaddr;
 	insn->kp.pre_handler = handler_insn_bp_pre_helper;
 	insn->kp.post_handler = handler_insn_bp_post_helper;
 	insn->kp.fault_handler = handler_insn_bp_fault_helper;
-
-	insn->is_bp = 1; // Ставим признак того, что точка прерывания поставлена.
 	
-	//Раскомментирую, когда дойдёт тестирование до этой стадии
-	//ret = 0; // Эмулирует успешный вызов
+	//ret = 0; // Эмулирует успешный вызов, если надо
 	ret = (register_kprobe(&insn->kp));
 	if (ret < 0) {
 		debug_util_print_string("\nRegister_kprobe failed, returned: ");
 		debug_util_print_u64(ret, "%d");
-		debug_util_print_string("\nTrying to unreg... ");
-		unregister_kprobe(&insn->kp);
-		ret = (register_kprobe(&insn->kp));
-		if (ret < 0) {
-			debug_util_print_string("Failed to rereg a bp!");
-			insn->is_bp = 0;
-			return;
-		}
-		debug_util_print_string("Success!");
+		return;
 	}
+	
+	insn->is_bp = 1; // Ставим признак того, что точка прерывания поставлена.
+	insn->is_disabled = 0; // Обязательно сбрасываем этот флаг при установке ТП
+	data.bp_count ++;
+		
 	debug_util_print_string("\nPlanted kprobe at: ");
 	debug_util_print_u64(PTR_ERR(insn->kp.addr), "%p");
 	debug_util_print_string(", ret code = ");
 	debug_util_print_u64(ret, "%d");
 	return;
 }
+
 
 // 4) Function to set "idle" timer to handle situations when breakpoints are not
 // triggered for too long.
@@ -624,25 +627,85 @@ void unset_hw_bp (struct mod_insn * data, struct insn * insn) {
 
 // 11) Function to unset an instruction bp
 void unset_insn_bp (struct insn * insn) {
+	// Функция пытается снять как enabled, так и disabled точки прерывания.
+	// Если вызвать из какого-либо хендлера, то будет дедлок, вместо этой фунции
+	// надо использовать disable_insn_bp()
 	// Функция снимает insn bp (в insn должна быть структура kprobes)
 	if (insn == NULL) return; // Очень важно!
 	if (!insn->is_bp) {
-		debug_util_print_string("Trying to unset not set bp: ");
+		debug_util_print_string("\nTrying to unset not set bp: ");
 		debug_util_print_u64(PTR_ERR(insn->kaddr), "%p");
 		return;
 	}
-	unregister_kprobe(&(insn->kp));
+	
+	unregister_kprobe(&(insn->kp)); // returns nothing
+	if (!insn->is_disabled) {
+		// Точка прерывания была активна -> уменьшаем счётчик
+		data.bp_count --;
+	}
 	insn->is_bp = 0;
-	debug_util_print_string("Instruction bp is unset: ");
+	insn->is_disabled = 0; // на всякий случай, мало ли чего
+	insn->pt_regs = NULL;
+	
+	debug_util_print_string("\nInstruction bp is unset: ");
 	debug_util_print_u64(PTR_ERR(insn->kaddr), "%p");
 }
 
-// 12) Function to determine a quantity of instuction breakpoints to set.
-uint calc_needed_bp (struct mod_insn *data) {
-	// Функция определяет количество, сколько нужно точек прерывания
-	// поставить. Уже есть выше. Можно удалять.
-	return 0;
+// 11.5) Function to disabpe the bp (not unset)
+void disable_insn_bp (struct insn * insn) {
+	// Функция не снимает bp, а только деактивирует её. Это помогает избежать дедлоков
+	// в хендлерах kprobes.
+	int ret = 0;
+	if (insn == NULL) return;
+	if (!insn->is_bp) {
+		debug_util_print_string("\nTrying to disable not set bp: ");
+		debug_util_print_u64(PTR_ERR(insn->kaddr), "%p");
+		return;
+	}
+	if (insn->is_disabled) {
+		debug_util_print_string("\nTrying to disable already disabled bp: ");
+		debug_util_print_u64(PTR_ERR(insn->kaddr), "%p");
+		return;
+	}
+	ret = disable_kprobe(&(insn->kp));
+	if (ret < 0) {
+		debug_util_print_string("\nFailed to disable a bp: ");
+		debug_util_print_u64(PTR_ERR(insn->kaddr), "%p");
+		return;
+	}
+	insn->is_disabled = 1;
+	data.bp_count --;
+	debug_util_print_string("\nInstruction bp is disabled: ");
+	debug_util_print_u64(PTR_ERR(insn->kaddr), "%p");
 }
+
+// 11.6) Function to enable the bp (already set)
+void enable_insn_bp (struct insn * insn) {
+	// Функция активирует точку прервания, которая уже установлена, но была деактивирована
+	int ret = 0;
+	if (insn == NULL) return;
+	if (!insn->is_bp) {
+		debug_util_print_string("\nTrying to enable not set bp: ");
+		debug_util_print_u64(PTR_ERR(insn->kaddr), "%p");
+		return;
+	}
+	if (!insn->is_disabled) {
+		debug_util_print_string("\nTrying to enabled not disabled bp: ");
+		debug_util_print_u64(PTR_ERR(insn->kaddr), "%p");
+		return;
+	}
+	ret = enable_kprobe(&(insn->kp));
+	if (ret < 0) {
+		debug_util_print_string("\nFailed to enable a bp: ");
+		debug_util_print_u64(PTR_ERR(insn->kaddr), "%p");
+		return;
+	}	
+	insn->is_disabled = 0;
+	data.bp_count ++; // число установленных точек прерывания
+	debug_util_print_string("\nInstruction bp is enabled: ");
+	debug_util_print_u64(PTR_ERR(insn->kaddr), "%p");	
+}
+
 
 
 //==================== Main functions =================
@@ -731,7 +794,7 @@ int handler_insn_bp_pre_helper(struct kprobe *p, struct pt_regs *regs) {
 	debug_util_print_u64(regs->ip, "%x");
 	debug_util_print_string(", flags = ");
 	debug_util_print_u64(regs->flags, "%1x");
-	//handler_insn_bp_pre(regs, p->addr, &data);
+	handler_insn_bp_pre(regs, p->addr, &data);
 	return 0;
 }
 
@@ -739,6 +802,7 @@ struct insn * get_insn_by_addr(void *address, struct mod_insn *data) {
 	int i;
 	struct insn * insn = NULL;
 	
+	// TODO: Сделать какую-нибудь хэш табличку, чтобы побыстрее это всё.
 	for (i = 0; i < data->size; i++) {
 		if (data->insns[i]->kaddr == address) {
 			// указатель на текущую анализируемую инструкцию
@@ -770,24 +834,23 @@ void handler_insn_bp_pre (struct pt_regs * pt_regs, void * address
 					, struct mod_insn * data) {
 	struct insn * insn = NULL;
 	
+	if (data->insn != NULL) {
+		// вообще, мы находимся в прехэндлере. Что делать, если мы
+		// уже какую-то другую инструкцию анализируем? Ну, наверное,
+		// снимать текущую точку прерывания.
+		disable_insn_bp(insn); // Из хендлеров только так.
+		return;
+	}
+	
 	insn = get_insn_by_addr(address, data); // seems ok
 	if (insn == NULL) {
 		// Мы не нашли инструкцию с таким адресом. Значит, ничего не поделаешь.
 		debug_util_print_string("\nUnknown triggered instruction. Something strange happened");
 		debug_util_print_string("\n");
 		return;
-	}
+	}		
 	
-	if (data->insn != NULL) {
-		// вообще, мы находимся в прехэндлере. Что делать, если мы
-		// уже какую-то другую инструкцию анализируем? Ну, наверное,
-		// снимать текущую точку прерывания.
-		unset_insn_bp(insn);
-		return;
-	} else {
-		data->insn = insn;
-	}
-	
+	data->insn = insn;
 	data->insn->pt_regs = pt_regs;
 	
 	// Пока там нечего вызывать...
@@ -818,34 +881,18 @@ void handler_insn_bp_post_helper(struct kprobe *p, struct pt_regs *regs
 // 14.5) Пост хэндлер Kprobes
 void handler_insn_bp_post (struct pt_regs * pt_regs, void * address
 						, struct mod_insn * data) {
-	int i, j;
-//	if (data->insn != NULL) {
-//		unset_insn_bp(data->insn); // Там просто is_bp = 0 и unset kprobes
-//		data->insn->pt_regs = NULL;
-//		data->insn = NULL;
-//	}
-//	// TODO: делать ещё очистку, если надо
-//	
-	// В целях дебага: посчитать количество всё ещё установленных точек прерывания
-	j = 0; // Счётчик установленных точек прерывания
-	for (i = 0; i < data->size; i++) {
-		if (data->insns[i]->is_bp && !kprobe_disabled(&(data->insns[i]->kp))) {
-			if (data->insns[i]->kaddr == address) {
-				//unset_insn_bp(data->insns[i]); // НЕЛЬЗЯ! DEADLOCK!
-				// TODO: Вместо этого можно пользоваться disable_kprobe/enable_kprobe
-				// http://www.kernel.org/doc/Documentation/kprobes.txt
-				// http://lxr.free-electrons.com/source/kernel/kprobes.c?v=2.6.39#L1851
-				disable_kprobe(&(data->insns[i]->kp));
-				data->insns[i]->pt_regs = NULL;
-			}
-			j ++;
-		}
+	if (data->insn == NULL) {
+		debug_util_print_string("\nFailed to handle insn in post handler: NULL insn struct.");
+		debug_util_print_string("\n");
+		return;		
 	}
+							
+	disable_insn_bp(data->insn);
+	data->insn = NULL; // Очищаем текущую фунцию "под рассмотрением"
+	// TODO: делать ещё очистку, если надо
 	
-	debug_util_print_string("\nThe number of the rest insn bp's: ");
-	debug_util_print_u64(j, "%d");
-	
-	// Let's test this shi-! =)
+	debug_util_print_string("\n[Post handler] The number of the rest insn bp's: ");
+	debug_util_print_u64(data->bp_count, "%d");
 }
 
 int handler_insn_bp_fault_helper(struct kprobe *p, struct pt_regs *regs
